@@ -256,9 +256,11 @@ function Add-Log([string]$line) {
 
 # ---------- 共享状态 (UI 与监听 runspace 之间) ----------
 $script:queue = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+$script:txQueue = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
 $script:flags = [hashtable]::Synchronized(@{ Stop = $false })
 $script:writer = $null; $script:reader = $null; $script:socket = $null
 $script:listener = $null; $script:listenerPs = $null
+$script:connector = $null; $script:connectorPs = $null; $script:cx = $null
 $script:seq = 0
 $script:asc = $null        # 最后一次环境声控制回包 payload
 $script:s2c = $null        # 最后一次免摘状态 0x00/0x01
@@ -280,7 +282,7 @@ function Set-Connected([bool]$on, [string]$msg) {
 
 # ---------- 监听 runspace (读帧 / 回 ACK / 分发事件) ----------
 $listenerScript = {
-  param($readerObj, $writerObj, $queue, $flags, $dllPath)
+  param($readerObj, $writerObj, $queue, $flags, $dllPath, $txQueue)
   [void][Reflection.Assembly]::LoadFrom($dllPath)
   function NF([byte]$type, [byte]$seq, [byte[]]$payload) {
     $body = New-Object System.Collections.Generic.List[byte]
@@ -309,6 +311,20 @@ $listenerScript = {
   }
   $rxbuf = New-Object System.Collections.Generic.List[byte]
   while (-not $flags['Stop']) {
+    # 发送队列: UI 只入队, 由监听线程统一写 (UI 是 STA, 不能碰 WinRT 异步)
+    while ($txQueue.Count -gt 0) {
+      $tx = $txQueue[0]
+      try { $txQueue.RemoveAt(0) } catch { break }
+      try {
+        $frame = NF 0x0c ([byte]$tx.seq) ([byte[]]$tx.payload)
+        [void][BtStream]::Write($writerObj, [byte[]]$frame)
+      } catch {
+        $queue.Add(@{kind='sendfail'; msg=$_.Exception.Message}) | Out-Null
+        $flags['Stop'] = $true
+        break
+      }
+    }
+    if ($flags['Stop']) { break }
     try { $chunk = [BtStream]::ReadPoll($readerObj, 300) } catch { $queue.Add(@{kind='closed'; msg=$_.Exception.Message}) | Out-Null; break }
     if ($null -eq $chunk) { continue }
     foreach ($b in $chunk) { $rxbuf.Add([byte]$b) }
@@ -353,6 +369,61 @@ $listenerScript = {
 }
 
 # ---------- 连接 / 断开 ----------
+# 连接脚本: 跑在 MTA runspace 里, 全程不碰 UI; 结果经 queue 回 UI 线程
+$connectScript = {
+  param($queue, $cx, $dllPath, $sppUuid)
+  [void][System.Reflection.Assembly]::LoadFrom($dllPath)
+  # UI 线程是 STA 且绝不能阻塞 WinRT 异步 (会死锁), 所以连接整体挪到这里 (MTA)
+  function CWait($op, [type]$retType, [int]$ms = 15000) {
+    $m = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+      $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+      $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+    $t = $m.MakeGenericMethod($retType).Invoke($null, @($op))
+    if (-not $t.Wait($ms)) { throw "WinRT 超时: $($op.GetType().Name)" }
+    return $t.Result
+  }
+  function CWaitAction($action, [int]$ms = 15000) {
+    $m = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+      $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+      $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' })[0]
+    $t = $m.Invoke($null, @($action))
+    if (-not $t.Wait($ms)) { throw "WinRT 超时: $($action.GetType().Name)" }
+  }
+  try {
+    $selector = [Windows.Devices.Bluetooth.BluetoothDevice]::GetDeviceSelectorFromPairingState($true)
+    $props = [string[]]@('System.ItemNameDisplay', 'System.Devices.Aep.DeviceAddress')
+    $devInfos = CWait ([Windows.Devices.Enumeration.DeviceInformation]::FindAllAsync($selector, $props)) ([Windows.Devices.Enumeration.DeviceInformationCollection]) 15000
+    if ($cx['Cancelled']) { return }
+    $sid = [Windows.Devices.Bluetooth.Rfcomm.RfcommServiceId]::FromUuid($sppUuid)
+    $target = $null; $targetName = ''
+    foreach ($di in $devInfos) {
+      if ($cx['Cancelled']) { return }
+      $addrStr = [string]$di.Properties['System.Devices.Aep.DeviceAddress']
+      if (-not $addrStr -or $addrStr -notmatch '^[0-9a-fA-F:]+$') {
+        if ($di.Id -match '([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})\s*$') { $addrStr = $Matches[1] }
+      }
+      if (-not $addrStr) { continue }
+      $addr = [UInt64]::Parse(($addrStr -replace ':', ''), [System.Globalization.NumberStyles]::HexNumber)
+      try {
+        $bt = CWait ([Windows.Devices.Bluetooth.BluetoothDevice]::FromBluetoothAddressAsync($addr)) ([Windows.Devices.Bluetooth.BluetoothDevice]) 8000
+        if (-not $bt) { continue }
+        $svcResult = CWait ($bt.GetRfcommServicesForIdAsync($sid)) ([Windows.Devices.Bluetooth.Rfcomm.RfcommDeviceServicesResult]) 10000
+        if ($svcResult.Services.Count -gt 0) { $target = $svcResult.Services[0]; $targetName = [string]$di.Properties['System.ItemNameDisplay']; break }
+      } catch { }
+    }
+    if ($cx['Cancelled']) { return }
+    if (-not $target) { $queue.Add(@{kind='connectfail'; msg='没找到耳机 (确认 XM5 已开机)'}) | Out-Null; return }
+    if ($cx['Cancelled']) { return }
+    $socket = New-Object Windows.Networking.Sockets.StreamSocket
+    CWaitAction ($socket.ConnectAsync($target.ConnectionHostName, $target.ServiceId.AsString())) 12000
+    if ($cx['Cancelled']) { try { [BtStream]::CloseSocket($socket) } catch {}; return }
+    $writer = [BtStream]::MakeWriter($socket)
+    $reader = [BtStream]::MakeReader($socket)
+    $queue.Add(@{kind='connected'; socket=$socket; writer=$writer; reader=$reader; name=$targetName}) | Out-Null
+  } catch {
+    $queue.Add(@{kind='connectfail'; msg=$_.Exception.Message}) | Out-Null
+  }
+}
 function Stop-Listener {
   if ($script:listenerPs) {
     $script:flags['Stop'] = $true
@@ -361,71 +432,39 @@ function Stop-Listener {
     $script:flags['Stop'] = $false
   }
 }
+function Stop-Connector {
+  if ($script:connectorPs) {
+    try { [void]$script:connectorPs.BeginStop($null, $null) } catch { }
+    $script:connectorPs = $null; $script:connector = $null
+  }
+}
 function Disconnect-Bt {
   Stop-Listener
+  if ($script:cx) { $script:cx['Cancelled'] = $true }   # 让还在跑的连接线程自己退出
+  Stop-Connector
   if ($script:reader) { try { [BtStream]::CloseReader($script:reader) } catch {} ; $script:reader = $null }
   if ($script:writer) { try { [BtStream]::CloseWriter($script:writer) } catch {} ; $script:writer = $null }
   if ($script:socket) { try { [BtStream]::CloseSocket($script:socket) } catch {} ; $script:socket = $null }
   $script:initOk = $false; $script:asc = $null; $script:s2c = $null
 }
 function Connect-Bt {
+  # UI 线程只负责起连接线程, 连接全程在 MTA runspace 里完成
   Disconnect-Bt
   Set-Connected $false '正在查找耳机...'
   Add-Log '查找已配对的 XM5...'
-  $selector = [Windows.Devices.Bluetooth.BluetoothDevice]::GetDeviceSelectorFromPairingState($true)
-  $props = [string[]]@('System.ItemNameDisplay', 'System.Devices.Aep.DeviceAddress')
-  $devInfos = Await ([Windows.Devices.Enumeration.DeviceInformation]::FindAllAsync($selector, $props)) ([Windows.Devices.Enumeration.DeviceInformationCollection])
-  $sid = [Windows.Devices.Bluetooth.Rfcomm.RfcommServiceId]::FromUuid($SPP_UUID)
-  $target = $null; $targetName = ''
-  foreach ($di in $devInfos) {
-    $addrStr = [string]$di.Properties['System.Devices.Aep.DeviceAddress']
-    if (-not $addrStr -or $addrStr -notmatch '^[0-9a-fA-F:]+$') {
-      if ($di.Id -match '([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})\s*$') { $addrStr = $Matches[1] }
-    }
-    if (-not $addrStr) { continue }
-    $addr = [UInt64]::Parse(($addrStr -replace ':', ''), [System.Globalization.NumberStyles]::HexNumber)
-    try {
-      $bt = Await ([Windows.Devices.Bluetooth.BluetoothDevice]::FromBluetoothAddressAsync($addr)) ([Windows.Devices.Bluetooth.BluetoothDevice]) 8000
-      if (-not $bt) { continue }
-      $svcResult = Await ($bt.GetRfcommServicesForIdAsync($sid)) ([Windows.Devices.Bluetooth.Rfcomm.RfcommDeviceServicesResult]) 10000
-      if ($svcResult.Services.Count -gt 0) { $target = $svcResult.Services[0]; $targetName = [string]$di.Properties['System.ItemNameDisplay']; break }
-    } catch { }
-  }
-  if (-not $target) { Set-Connected $false '没找到耳机 (确认 XM5 已开机)'; Add-Log '没找到带索尼 SPP 服务的设备'; return }
-  Add-Log "命中 SPP 服务: $targetName"
-  Set-Connected $false '正在连接...'
-  $socket = New-Object Windows.Networking.Sockets.StreamSocket
-  AwaitAction ($socket.ConnectAsync($target.ConnectionHostName, $target.ServiceId.AsString())) 12000
-  $script:socket = $socket
-  $script:writer = [BtStream]::MakeWriter($socket)
-  $script:reader = [BtStream]::MakeReader($socket)
-  $script:seq = 0
-  # 监听线程
-  $script:listener = [runspacefactory]::CreateRunspace()
-  $script:listener.Open()
-  $script:listenerPs = [powershell]::Create()
-  $script:listenerPs.Runspace = $script:listener
-  [void]$script:listenerPs.AddScript($listenerScript).AddArgument($script:reader).AddArgument($script:writer).AddArgument($script:queue).AddArgument($script:flags).AddArgument($dllFile)
-  [void]$script:listenerPs.BeginInvoke()
-  Set-Connected $true "已连接 $targetName"
-  Add-Log 'RFCOMM 已连接, 发送 init 握手...'
-  # init 握手: 发一次, 没回包由 UI 定时器重试 (UI 线程不能死等, 否则 DispatcherTimer 不跑)
-  $script:initOk = $false
-  $script:initTries = 1
-  $script:lastInitAt = [DateTime]::UtcNow
-  Send-Raw ([byte[]]@(0x00, 0x00))
+  $script:cx = [hashtable]::Synchronized(@{ Cancelled = $false })
+  $script:connector = [runspacefactory]::CreateRunspace()
+  $script:connector.Open()
+  $script:connectorPs = [powershell]::Create()
+  $script:connectorPs.Runspace = $script:connector
+  [void]$script:connectorPs.AddScript($connectScript).AddArgument($script:queue).AddArgument($script:cx).AddArgument($dllFile).AddArgument($SPP_UUID)
+  [void]$script:connectorPs.BeginInvoke()
 }
 function Send-Raw([byte[]]$payload) {
-  if (-not $script:writer) { Add-Log '(未连接, 忽略操作)'; return }
-  try {
-    $frame = New-Frame -type 0x0c -seq ([byte]$script:seq) -payload $payload
-    [void][BtStream]::Write($script:writer, [byte[]]$frame)
-    $script:seq = ($script:seq + 1) -band 0xFF
-  } catch {
-    Add-Log "发送失败: $($_.Exception.Message) —— 按断开处理"
-    Disconnect-Bt
-    Set-Connected $false '连接已断开 (点重连)'
-  }
+  # UI 线程 (STA) 不碰 WinRT 写, 只入队; 由监听线程统一写
+  if (-not $script:socket) { Add-Log '(未连接, 忽略操作)'; return }
+  $script:txQueue.Add(@{ seq = [byte]$script:seq; payload = [byte[]]$payload }) | Out-Null
+  $script:seq = ($script:seq + 1) -band 0xFF
 }
 
 # ---------- 操作 ----------
@@ -554,6 +593,33 @@ $timer.Add_Tick({
         Add-Log "环境声: $modeTxt, 等级 $lv, 关注语音 $(if ($focus) { '开' } else { '关' })"
       }
       'log' { Add-Log $ev.msg }
+      'connected' {
+        # 连接线程报捷: 存对象、起监听线程、发 init 握手 (发一次, 没回包由本定时器重试)
+        $script:socket = $ev.socket; $script:writer = $ev.writer; $script:reader = $ev.reader
+        $script:seq = 0
+        $script:listener = [runspacefactory]::CreateRunspace()
+        $script:listener.Open()
+        $script:listenerPs = [powershell]::Create()
+        $script:listenerPs.Runspace = $script:listener
+        [void]$script:listenerPs.AddScript($listenerScript).AddArgument($script:reader).AddArgument($script:writer).AddArgument($script:queue).AddArgument($script:flags).AddArgument($dllFile).AddArgument($script:txQueue)
+        [void]$script:listenerPs.BeginInvoke()
+        Set-Connected $true "已连接 $($ev.name)"
+        Add-Log 'RFCOMM 已连接, 发送 init 握手...'
+        $script:initOk = $false
+        $script:initTries = 1
+        $script:lastInitAt = [DateTime]::UtcNow
+        Send-Raw ([byte[]]@(0x00, 0x00))
+      }
+      'connectfail' {
+        Add-Log "连接失败: $($ev.msg)"
+        Disconnect-Bt
+        Set-Connected $false "连接失败: $($ev.msg)"
+      }
+      'sendfail' {
+        Add-Log "发送失败: $($ev.msg) —— 按断开处理"
+        Disconnect-Bt
+        Set-Connected $false '连接已断开 (点重连)'
+      }
       'closed' {
         Add-Log "耳机连接断开 ($($ev.msg))"
         Disconnect-Bt
