@@ -468,6 +468,25 @@ function Send-Raw([byte[]]$payload) {
 }
 
 # ---------- 操作 ----------
+# 立即点亮选中的模式按钮 (不等耳机回包, 回包到了再校正)
+function Set-ModeUi([string]$modeTxt) {
+  foreach ($b in 'BtnNC','BtnAMB','BtnOff') {
+    $ctl[$b].Background = Brush '#F0F0F0'; $ctl[$b].Foreground = Brush '#1B1B1B'
+  }
+  $active = switch ($modeTxt) { '降噪' { 'BtnNC' } '环境声' { 'BtnAMB' } '关闭' { 'BtnOff' } }
+  if ($active) { $ctl[$active].Background = Brush '#0067C0'; $ctl[$active].Foreground = Brush 'White' }
+}
+function Set-S2cUi([bool]$on) {
+  if ($on) {
+    $ctl['S2cState'].Text = '状态: 开启 (说话会自动暂停音乐)'
+    $ctl['S2cState'].Foreground = Brush '#B45309'
+    $ctl['BtnS2c'].Content = '关闭免摘'
+  } else {
+    $ctl['S2cState'].Text = '状态: 已关闭'
+    $ctl['S2cState'].Foreground = Brush '#15803D'
+    $ctl['BtnS2c'].Content = '开启免摘'
+  }
+}
 function Op-Ambient([string]$mode) {
   # mode: nc / amb / off ; 基于最后一次 ASC 回包镜像, 只改 [3] NC开关 与 [4] 模式位
   if (-not $script:asc) { Add-Log '还没拿到环境声状态, 先等查询回包'; return }
@@ -481,6 +500,7 @@ function Op-Ambient([string]$mode) {
     'off' { $set[3] = 0x00; $set[4] = 0x00 }
   }
   Send-Raw $set
+  Set-ModeUi $(switch ($mode) { 'nc' { '降噪' } 'amb' { '环境声' } 'off' { '关闭' } })
   Add-Log "环境声 → $mode"
 }
 function Op-Level([int]$level) {
@@ -505,7 +525,9 @@ function Op-Focus([bool]$on) {
 }
 function Op-S2c([bool]$on) {
   $val = if ($on) { 0x00 } else { 0x01 }
+  $script:s2c = if ($on) { 0x00 } else { 0x01 }   # 乐观更新, 耳机回包来了再校正
   Send-Raw ([byte[]]@(0xf8, 0x0c, $val, 0x01))
+  Set-S2cUi $on
   Add-Log ("智能免摘 → " + $(if ($on) { '开启' } else { '关闭' }))
 }
 
@@ -517,7 +539,8 @@ $ctl['BtnNC'].Add_Click({ Op-Ambient 'nc' })
 $ctl['BtnAMB'].Add_Click({ Op-Ambient 'amb' })
 $ctl['BtnOff'].Add_Click({ Op-Ambient 'off' })
 $ctl['BtnS2c'].Add_Click({
-  if ($script:s2c -eq 0x00) { Op-S2c $false } elseif ($script:s2c -eq 0x01) { Op-S2c $true }
+  # 状态未知时默认按"开启"处理 (XM5 初始多为关闭), 之后由本地状态翻转
+  if ($script:s2c -eq 0x00) { Op-S2c $false } else { Op-S2c $true }
 })
 $ctl['ChkFocus'].Add_Click({
   $cur = if ($script:asc) { $fi = if ($script:asc[1] -eq 0x17 -and $script:asc.Length -ge 8) { 6 } else { 5 }; $script:asc[$fi] -eq 0x01 } else { $false }
@@ -563,15 +586,7 @@ $timer.Add_Tick({
       }
       's2c' {
         $script:s2c = $ev.state
-        if ($ev.state -eq 0x00) {
-          $ctl['S2cState'].Text = '状态: 开启 (说话会自动暂停音乐)'
-          $ctl['S2cState'].Foreground = Brush '#B45309'
-          $ctl['BtnS2c'].Content = '关闭免摘'
-        } elseif ($ev.state -eq 0x01) {
-          $ctl['S2cState'].Text = '状态: 已关闭'
-          $ctl['S2cState'].Foreground = Brush '#15803D'
-          $ctl['BtnS2c'].Content = '开启免摘'
-        }
+        Set-S2cUi ($ev.state -eq 0x00)
       }
       'asc' {
         $script:asc = $ev.payload
@@ -585,11 +600,8 @@ $timer.Add_Tick({
         if ([int]$ctl['AsmSlider'].Value -ne $lv) { $ctl['AsmSlider'].Value = $lv }
         $script:suppressSlider = $false
         $ctl['ChkFocus'].IsChecked = $focus
-        foreach ($b in 'BtnNC','BtnAMB','BtnOff') {
-          $ctl[$b].Background = Brush '#F0F0F0'; $ctl[$b].Foreground = Brush '#1B1B1B'
-        }
-        $active = switch ($modeTxt) { '降噪' { 'BtnNC' } '环境声' { 'BtnAMB' } '关闭' { 'BtnOff' } }
-        if ($active) { $ctl[$active].Background = Brush '#0067C0'; $ctl[$active].Foreground = Brush 'White' }
+        Set-ModeUi $modeTxt
+        if ($null -eq $script:s2c -and -not $script:s2cTries) { $script:s2cTries = 1; Send-Raw ([byte[]]@(0xf6, 0x0c)) }
         Add-Log "环境声: $modeTxt, 等级 $lv, 关注语音 $(if ($focus) { '开' } else { '关' })"
       }
       'log' { Add-Log $ev.msg }
